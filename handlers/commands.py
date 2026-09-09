@@ -1,6 +1,9 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from services.football_api import fetch_matches, format_match, fetch_standings, COMPETITION_NAMES
+from services.football_api import (
+    fetch_matches, fetch_today_matches, format_match, fetch_standings, COMPETITION_NAMES,
+    group_and_format_fixtures, today_uz_date_label,
+)
 from services import api_football
 from services.formatter import standings_caption
 
@@ -47,37 +50,44 @@ async def fixtures_results_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     if data == "fx:morning":
-        matches = fetch_today_matches()
-        matches += api_football.fetch_today_matches()
-        unique = {}
-        for m in matches:
-            if m.get("id") is not None:
-                unique[str(m["id"])] = m
-        scheduled = [
-            m for m in unique.values()
-            if m.get("status") in {"SCHEDULED", "TIMED"}
-        ]
-        scheduled.sort(key=lambda m: m.get("utcDate", ""))
-
         keyboard = [[InlineKeyboardButton("🔙 Fixtures & Results", callback_data="fx_menu")]]
-        if not scheduled:
+        await query.edit_message_text("⏳ Yuklanmoqda...", parse_mode="HTML")
+        try:
+            matches = fetch_today_matches()
+            matches += api_football.fetch_today_matches()
+            unique = {}
+            for m in matches:
+                if m.get("id") is not None:
+                    unique[str(m["id"])] = m
+            scheduled = [
+                m for m in unique.values()
+                if m.get("status") in {"SCHEDULED", "TIMED"}
+            ]
+            scheduled.sort(key=lambda m: m.get("utcDate", ""))
+
+            if not scheduled:
+                await query.edit_message_text(
+                    "❌ Bugun uchun rejalashtirilgan fixture topilmadi.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+                return
+
+            text = (
+                f"🌅 <b>Ertalabki fixtures — {today_uz_date_label()}</b>\n\n"
+                + group_and_format_fixtures(scheduled)
+            )
             await query.edit_message_text(
-                "❌ Bugun uchun rejalashtirilgan fixture topilmadi.",
+                text,
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
-            return
-
-        from services.football_api import group_and_format_fixtures, today_uz_date_label
-        text = (
-            f"🌅 <b>Ertalabki fixtures — {today_uz_date_label()}</b>\n\n"
-            + group_and_format_fixtures(scheduled)
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Xatolik: {e}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         return
 
     if data == "fx:results":
@@ -145,32 +155,38 @@ async def league_standings_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     await query.edit_message_text("⏳ Jadval yuklanmoqda...")
+    keyboard = [[InlineKeyboardButton("🔙 Ligalar", callback_data="standings_menu")]]
 
-    if code in {"PL", "PD", "SA", "BL1", "FL1"}:
-        table = fetch_standings(code)
-    elif code == "MLS":
-        table = api_football.fetch_standings("USA", "MLS")
-    elif code == "UZS":
-        table = api_football.fetch_standings("Uzbekistan", "Super League")
-    else:
-        table = []
+    try:
+        if code in {"PL", "PD", "SA", "BL1", "FL1"}:
+            table = fetch_standings(code)
+        elif code == "MLS":
+            table = api_football.fetch_standings("USA", "MLS")
+        elif code == "UZS":
+            table = api_football.fetch_standings("Uzbekistan", "Super League")
+        else:
+            table = []
 
-    if not table:
-        keyboard = [[InlineKeyboardButton("🔙 Ligalar", callback_data="standings_menu")]]
+        if not table:
+            await query.edit_message_text(
+                f"❌ <b>{competition_name}</b> jadvali hozircha olinmadi.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        text = standings_caption(competition_name, table, limit=20)
         await query.edit_message_text(
-            f"❌ <b>{competition_name}</b> jadvali hozircha olinmadi.",
+            text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        return
-
-    text = standings_caption(competition_name, table, limit=20)
-    keyboard = [[InlineKeyboardButton("🔙 Ligalar", callback_data="standings_menu")]]
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ Xatolik: {e}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def results_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,32 +226,39 @@ async def league_results_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await query.edit_message_text("⏳ Natijalar yuklanmoqda...")
-
-    if code in {"PL", "PD", "SA", "BL1", "FL1", "CL"}:
-        matches = fetch_today_matches(status="FINISHED")
-        matches = [m for m in matches if m.get("competition", {}).get("code") == code]
-    elif code == "MLS":
-        matches = [m for m in api_football.fetch_today_matches()
-                   if m.get("status") == "FINISHED" and m.get("competition", {}).get("code") == "MLS"]
-    elif code == "UZS":
-        matches = [m for m in api_football.fetch_today_matches()
-                   if m.get("status") == "FINISHED" and m.get("competition", {}).get("code") == "UZS"]
-    else:
-        matches = []
-
     keyboard = [[InlineKeyboardButton("🔙 Natijalar", callback_data="results_menu")]]
-    if not matches:
+
+    try:
+        if code in {"PL", "PD", "SA", "BL1", "FL1", "CL"}:
+            matches = fetch_today_matches(status="FINISHED")
+            matches = [m for m in matches if m.get("competition", {}).get("code") == code]
+        elif code == "MLS":
+            matches = [m for m in api_football.fetch_today_matches()
+                       if m.get("status") == "FINISHED" and m.get("competition", {}).get("code") == "MLS"]
+        elif code == "UZS":
+            matches = [m for m in api_football.fetch_today_matches()
+                       if m.get("status") == "FINISHED" and m.get("competition", {}).get("code") == "UZS"]
+        else:
+            matches = []
+
+        if not matches:
+            await query.edit_message_text(
+                f"❌ <b>{competition_name}</b> uchun bugun yakunlangan o'yin topilmadi.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        lines = [f"🏁 <b>{competition_name} — Bugungi final natijalar</b>\n"]
+        lines.extend(format_match(m) for m in matches)
         await query.edit_message_text(
-            f"❌ <b>{competition_name}</b> uchun bugun yakunlangan o'yin topilmadi.",
+            "\n\n".join(lines),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        return
-
-    lines = [f"🏁 <b>{competition_name} — Bugungi final natijalar</b>\n"]
-    lines.extend(format_match(m) for m in matches)
-    await query.edit_message_text(
-        "\n\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ Xatolik: {e}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
