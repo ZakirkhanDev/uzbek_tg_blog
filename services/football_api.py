@@ -1,17 +1,12 @@
 import os
 import requests
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone, timedelta, time
 from zoneinfo import ZoneInfo
 
 BASE_URL = "https://api.football-data.org/v4"
 
-# Big 5 ligalar
 LEAGUES = ["PL", "PD", "SA", "BL1", "FL1"]
-
-# Kubok/turnirlar (football-data.org bepul reja doirasida)
 CUPS = ["CL", "WC", "EC"]
-
-# Kunlik fixtures/natijalar uchun barcha musobaqalar
 ALL_COMPETITIONS = LEAGUES + CUPS
 
 COMPETITION_NAMES = {
@@ -26,218 +21,212 @@ COMPETITION_NAMES = {
 }
 
 UZ_TZ = ZoneInfo("Asia/Tashkent")
-HOUSTON_TZ = ZoneInfo("America/Chicago")  # Houston, TX (CDT/CST)
+HOUSTON_TZ = ZoneInfo("America/Chicago")
+UTC = timezone.utc
 
-def dual_time(utc_date_str):
-    """utcDate ('2026-06-15T18:00:00Z') dan UZ va Houston (TX) vaqtini qaytaradi."""
-    if not utc_date_str:
-        return "?", "?"
-    try:
-        dt = datetime.strptime(utc_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=ZoneInfo("UTC"))
-        uz = dt.astimezone(UZ_TZ).strftime("%H:%M")
-        us = dt.astimezone(HOUSTON_TZ).strftime("%H:%M")
-        return uz, us
-    except ValueError:
-        return "?", "?"
-
+# Exact 12 clubs used for automatic final-result posts.
 TOP_CLUBS = {
-    "real madrid",
-    "barcelona",
-    "paris saint-germain", "psg",
-    "liverpool",
-    "manchester city", "man city",
-    "arsenal",
-    "bayern münchen", "bayern munich", "fc bayern münchen",
-    "ac milan", "milan",
-    "inter", "internazionale", "inter milan",
-    "manchester united", "man utd",
-    "atletico madrid", "atlético madrid",
+    "real madrid", "real madrid cf",
+    "barcelona", "fc barcelona",
+    "paris saint-germain", "paris saint germain", "psg",
+    "liverpool", "liverpool fc",
+    "manchester city", "man city", "manchester city fc",
+    "arsenal", "arsenal fc",
+    "bayern münchen", "bayern munich", "fc bayern münchen", "fc bayern munich",
+    "ac milan", "milan", "ac milan spa",
+    "inter", "internazionale", "inter milan", "fc internazionale milano",
+    "manchester united", "man utd", "manchester united fc",
+    "atletico madrid", "atlético madrid", "club atletico de madrid",
+    "juventus", "juventus fc",
 }
 
+
+def normalize_team_name(name):
+    return " ".join((name or "").strip().lower().replace("’", "'").split())
+
+
 def is_top_club(name):
-    if not name:
+    n = normalize_team_name(name)
+    if not n:
         return False
-    n = name.strip().lower()
-    return any(club in n for club in TOP_CLUBS)
+    return n in TOP_CLUBS or any(alias in n for alias in TOP_CLUBS if len(alias) > 5)
 
-# O'zbekiston Superligasidan jonli-gol xabarnomasi kerak bo'lgan klublar
-UZ_TOP_CLUBS = {"navbahor", "pakhtakor", "neftchi", "nasaf"}
-
-def is_uz_top_club(name):
-    if not name:
-        return False
-    n = name.strip().lower()
-    return any(club in n for club in UZ_TOP_CLUBS)
 
 def _headers():
     key = os.getenv("FOOTBALL_API_KEY")
     return {"X-Auth-Token": key} if key else {}
 
-def fetch_matches(status="LIVE"):
-    if not os.getenv("FOOTBALL_API_KEY"):
-        return []
-    try:
-        r = requests.get(
-            f"{BASE_URL}/matches",
-            headers=_headers(),
-            params={"status": status, "competitions": ",".join(ALL_COMPETITIONS)},
-            timeout=15
-        )
-        r.raise_for_status()
-        return r.json().get("matches", [])
-    except requests.RequestException:
-        return []
 
-def fetch_today_matches(status=None):
-    if not os.getenv("FOOTBALL_API_KEY"):
-        return []
-    today = datetime.now(timezone.utc).astimezone(UZ_TZ).date().isoformat()
-    params = {
-        "competitions": ",".join(ALL_COMPETITIONS),
-        "dateFrom": today,
-        "dateTo": today,
-    }
-    if status:
-        params["status"] = status
-    try:
-        r = requests.get(
-            f"{BASE_URL}/matches",
-            headers=_headers(),
-            params=params,
-            timeout=15
-        )
-        r.raise_for_status()
-        return r.json().get("matches", [])
-    except requests.RequestException:
-        return []
+def _uz_date_utc_window(day):
+    start_utc = datetime.combine(day, time.min, tzinfo=UZ_TZ).astimezone(UTC)
+    end_utc = datetime.combine(day + timedelta(days=1), time.min, tzinfo=UZ_TZ).astimezone(UTC)
+    return start_utc.date().isoformat(), end_utc.date().isoformat()
 
-def fetch_match_detail(match_id):
-    """Bitta o'yin haqida to'liq ma'lumot (gol muallifi/assist uchun)."""
+
+def _uz_day_utc_window():
+    now_uz = datetime.now(UTC).astimezone(UZ_TZ)
+    day = now_uz.date()
+    start_date, end_date = _uz_date_utc_window(day)
+    return start_date, end_date, day
+
+
+def dual_time(utc_date_str):
+    if not utc_date_str:
+        return "?", "?"
+    try:
+        raw = utc_date_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw).astimezone(UTC)
+        uz = dt.astimezone(UZ_TZ).strftime("%H:%M")
+        us_dt = dt.astimezone(HOUSTON_TZ)
+        if us_dt.minute == 0:
+            us = us_dt.strftime("%-I %p").lower()
+        else:
+            us = us_dt.strftime("%-I:%M %p").lower()
+        return uz, us
+    except (ValueError, TypeError):
+        return "?", "?"
+
+
+def _request(path, params=None):
     if not os.getenv("FOOTBALL_API_KEY"):
         return None
     try:
-        r = requests.get(
-            f"{BASE_URL}/matches/{match_id}",
-            headers=_headers(),
-            timeout=15
-        )
+        r = requests.get(f"{BASE_URL}{path}", headers=_headers(), params=params or {}, timeout=20)
         r.raise_for_status()
         return r.json()
     except requests.RequestException:
         return None
 
-def goal_scorer_for_score(match_detail, home_score, away_score, previous_home=None, previous_away=None):
-    """Yangi hisobga mos aynan gol muallifini topadi.
 
-    Oddiy last-goal yondashuvi o'rniga hisobdagi o'zgarishni hisobga oladi.
-    Shu sabab 2:1 ga chiqqanida oldingi gol emas, aynan 2:1 ni qilgan futbolchi olinadi.
-    """
-    if not match_detail:
-        return None, None
-    goals = match_detail.get("goals") or []
-    if not goals:
-        return None, None
-
-    try:
-        target_home = int(home_score or 0)
-        target_away = int(away_score or 0)
-        prev_home = int(previous_home or 0)
-        prev_away = int(previous_away or 0)
-    except (TypeError, ValueError):
-        return None, None
-
-    home_scored = max(0, target_home - prev_home)
-    away_scored = max(0, target_away - prev_away)
-
-    # API qaytargan goal ro'yxati odatda vaqt tartibida bo'ladi.
-    # Hisob o'zgarishiga mos jamoaning eng oxirgi golini tanlaymiz.
-    normal_goals = [g for g in goals if g.get("type") != "Own Goal"]
-    candidates = normal_goals or goals
-
-    def team_name(goal):
-        return ((goal.get("team") or {}).get("name") or "").strip().lower()
-
-    home_name = ((match_detail.get("homeTeam") or {}).get("name") or "").strip().lower()
-    away_name = ((match_detail.get("awayTeam") or {}).get("name") or "").strip().lower()
-
-    if home_scored > 0 and away_scored == 0:
-        team_goals = [g for g in candidates if team_name(g) == home_name] if home_name else []
-        if team_goals:
-            last = team_goals[-1]
-        else:
-            last = candidates[-1]
-    elif away_scored > 0 and home_scored == 0:
-        team_goals = [g for g in candidates if team_name(g) == away_name] if away_name else []
-        if team_goals:
-            last = team_goals[-1]
-        else:
-            last = candidates[-1]
-    else:
-        last = candidates[-1]
-
-    scorer = (last.get("scorer") or {}).get("name")
-    assist = (last.get("assist") or {}).get("name")
-    return scorer, assist
+def fetch_matches(status="LIVE"):
+    data = _request("/matches", {"status": status, "competitions": ",".join(ALL_COMPETITIONS)})
+    return (data or {}).get("matches", [])
 
 
-def last_goal_scorer_assist(match_detail):
-    """Backward-compatible helper: oxirgi gol muallifi va assistini qaytaradi."""
-    if not match_detail:
-        return None, None
-    goals = match_detail.get("goals") or []
-    if not goals:
-        return None, None
-    last = goals[-1]
-    return (last.get("scorer") or {}).get("name"), (last.get("assist") or {}).get("name")
+def fetch_today_matches(status=None):
+    """Fetch matches belonging to today's Uzbekistan calendar date."""
+    _, _, day = _uz_day_utc_window()
+    return fetch_matches_for_uz_dates([day], status=status)
 
-def fetch_standings(competition_code):
+
+def fetch_recent_matches(status=None):
+    """Fetch yesterday + today in Uzbekistan time; useful for late finished matches."""
+    day = datetime.now(UTC).astimezone(UZ_TZ).date()
+    return fetch_matches_for_uz_dates([day - timedelta(days=1), day], status=status)
+
+
+def fetch_matches_for_uz_dates(days, status=None):
     if not os.getenv("FOOTBALL_API_KEY"):
         return []
+    days = sorted(set(days))
+    if not days:
+        return []
+    start_date, _ = _uz_date_utc_window(days[0])
+    _, end_date = _uz_date_utc_window(days[-1])
+    data = _request("/matches", {
+        "competitions": ",".join(ALL_COMPETITIONS),
+        "dateFrom": start_date,
+        "dateTo": end_date,
+    })
+    matches = (data or {}).get("matches", [])
+    wanted = set(days)
+    out = []
+    for m in matches:
+        raw = m.get("utcDate")
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UZ_TZ)
+            if dt.date() not in wanted:
+                continue
+        except (AttributeError, ValueError):
+            continue
+        if status and m.get("status") != status:
+            continue
+        out.append(m)
+    return out
+
+
+def fetch_match_detail(match_id):
+    return _request(f"/matches/{match_id}")
+
+
+def enrich_finished_match(match):
+    """Attach compact goal events for a final-result graphic/caption."""
+    detail = fetch_match_detail(match.get("id"))
+    if not detail:
+        return match
+    events = []
+    for goal in detail.get("goals") or []:
+        scorer = (goal.get("scorer") or {}).get("name")
+        if not scorer:
+            continue
+        minute = goal.get("minute")
+        extra = goal.get("injuryTime")
+        minute_label = f"{minute}+{extra}" if minute and extra else minute
+        team = (goal.get("team") or {}).get("name")
+        events.append({
+            "minute": minute_label,
+            "scorer": scorer,
+            "assist": (goal.get("assist") or {}).get("name"),
+            "team": team,
+        })
+    match = dict(match)
+    match["events"] = events
+    return match
+
+
+def goal_scorer_for_score(match_detail, home_score, away_score, previous_home=None, previous_away=None):
+    if not match_detail:
+        return None, None
+    goals = [g for g in (match_detail.get("goals") or []) if g.get("scorer")]
+    if not goals:
+        return None, None
     try:
-        r = requests.get(
-            f"{BASE_URL}/competitions/{competition_code}/standings",
-            headers=_headers(),
-            timeout=15
-        )
-        r.raise_for_status()
-        data = r.json()
-        for group in data.get("standings", []):
-            if group.get("type") == "TOTAL":
-                return group.get("table", [])
-        return []
-    except requests.RequestException:
-        return []
+        ph = int(previous_home or 0)
+        pa = int(previous_away or 0)
+        h = int(home_score or 0)
+        a = int(away_score or 0)
+    except (TypeError, ValueError):
+        return None, None
+    home_scored = h > ph
+    away_scored = a > pa
+    home_name = normalize_team_name((match_detail.get("homeTeam") or {}).get("name"))
+    away_name = normalize_team_name((match_detail.get("awayTeam") or {}).get("name"))
+    candidates = goals
+    if home_scored and not away_scored:
+        same = [g for g in candidates if normalize_team_name((g.get("team") or {}).get("name")) == home_name]
+        last = same[-1] if same else candidates[-1]
+    elif away_scored and not home_scored:
+        same = [g for g in candidates if normalize_team_name((g.get("team") or {}).get("name")) == away_name]
+        last = same[-1] if same else candidates[-1]
+    else:
+        last = candidates[-1]
+    return (last.get("scorer") or {}).get("name"), (last.get("assist") or {}).get("name")
+
+
+def fetch_standings(competition_code):
+    data = _request(f"/competitions/{competition_code}/standings")
+    for group in (data or {}).get("standings", []):
+        if group.get("type") == "TOTAL":
+            return group.get("table", [])
+    return []
+
 
 def format_match(match):
     home = match.get("homeTeam", {}).get("shortName") or match.get("homeTeam", {}).get("name", "Home")
     away = match.get("awayTeam", {}).get("shortName") or match.get("awayTeam", {}).get("name", "Away")
-
-    score = match.get("score", {})
-    full = score.get("fullTime", {})
-    h = full.get("home")
-    a = full.get("away")
-    h = 0 if h is None else h
-    a = 0 if a is None else a
-
+    score = match.get("score", {}).get("fullTime", {})
+    h = 0 if score.get("home") is None else score.get("home")
+    a = 0 if score.get("away") is None else score.get("away")
     code = match.get("competition", {}).get("code", "")
     competition = COMPETITION_NAMES.get(code) or match.get("competition", {}).get("name", "Futbol")
     status = match.get("status", "UNKNOWN")
-
     status_map = {
-        "LIVE": "🔴 JONLI",
-        "IN_PLAY": "🔴 JONLI",
-        "PAUSED": "⏸ TANAFFUS",
-        "FINISHED": "🏁 YAKUNLANDI",
-        "POSTPONED": "⏸ QOLDIRILDI",
-        "SCHEDULED": "🕒 REJALASHTIRILGAN",
-        "TIMED": "🕒 REJALASHTIRILGAN",
+        "LIVE": "🔴 JONLI", "IN_PLAY": "🔴 JONLI", "PAUSED": "⏸ TANAFFUS",
+        "FINISHED": "🏁 YAKUNLANDI", "POSTPONED": "⏸ QOLDIRILDI",
+        "SCHEDULED": "🕒 REJALASHTIRILGAN", "TIMED": "🕒 REJALASHTIRILGAN",
     }
+    return f"⚽ <b>{competition}</b>\n\n{home}  <b>{h} : {a}</b>  {away}\n{status_map.get(status, status)}"
 
-    return (
-        f"⚽ <b>{competition}</b>\n\n"
-        f"{home}  <b>{h} : {a}</b>  {away}\n"
-        f"{status_map.get(status, status)}"
-    )
 
 def format_fixture(match):
     home = match.get("homeTeam", {}).get("shortName") or match.get("homeTeam", {}).get("name", "Home")
@@ -245,49 +234,33 @@ def format_fixture(match):
     code = match.get("competition", {}).get("code", "")
     competition = COMPETITION_NAMES.get(code) or match.get("competition", {}).get("name", "Futbol")
     uz_time, us_time = dual_time(match.get("utcDate", ""))
-    return (
-        f"🏆 <i>{competition}</i>\n"
-        f"⚽ <b>{home}</b> — <b>{away}</b>\n"
-        f"🇺🇿 {uz_time}   |   🇺🇸 {us_time} CDT"
-    )
+    return f"🏆 <i>{competition}</i>\n⚽ <b>{home}</b> — <b>{away}</b>\n🇺🇿 {uz_time}  |  🇺🇸 {us_time} CDT"
 
-UZ_MONTHS = {
-    1: "yanvar", 2: "fevral", 3: "mart", 4: "aprel", 5: "may", 6: "iyun",
-    7: "iyul", 8: "avgust", 9: "sentabr", 10: "oktabr", 11: "noyabr", 12: "dekabr",
-}
+
+UZ_MONTHS = {1:"yanvar",2:"fevral",3:"mart",4:"aprel",5:"may",6:"iyun",7:"iyul",8:"avgust",9:"sentabr",10:"oktabr",11:"noyabr",12:"dekabr"}
+
 
 def today_uz_date_label():
-    """Bugungi sanani '6-sentabr' ko'rinishida qaytaradi (Toshkent vaqti bo'yicha)."""
-    d = datetime.now(timezone.utc).astimezone(UZ_TZ).date()
+    d = datetime.now(UTC).astimezone(UZ_TZ).date()
     return f"{d.day}-{UZ_MONTHS[d.month]}"
 
+
 def group_and_format_fixtures(matches):
-    """Kunlik o'yinlarni musobaqa bo'yicha guruhlab, har biriga UZ/US (CDT) vaqtini qo'shib matn qiladi."""
     groups = {}
     for m in matches:
         code = m.get("competition", {}).get("code", "")
         name = COMPETITION_NAMES.get(code) or m.get("competition", {}).get("name", "Futbol")
         groups.setdefault(name, []).append(m)
-
-    # Avval bilgan (PL/PD/SA/BL1/FL1/CL/WC/EC) ligalar tartibi bo'yicha, keyin
-    # boshqa manbadan kelgan (kubok, MLS) guruhlar nomi bo'yicha alifbo tartibida
-    ordered_names = []
-    for code in ALL_COMPETITIONS:
-        name = COMPETITION_NAMES.get(code, code)
-        if name in groups and name not in ordered_names:
-            ordered_names.append(name)
-    for name in sorted(groups.keys()):
-        if name not in ordered_names:
-            ordered_names.append(name)
-
+    order = [COMPETITION_NAMES[c] for c in ALL_COMPETITIONS]
+    names = [n for n in order if n in groups] + [n for n in sorted(groups) if n not in order]
     blocks = []
-    for name in ordered_names:
-        ms = sorted(groups[name], key=lambda m: m.get("utcDate", ""))
+    for name in names:
+        ms = sorted(groups[name], key=lambda x: x.get("utcDate", ""))
         lines = [f"🏆 <b>{name}</b>"]
         for m in ms:
             home = m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "Home")
             away = m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "Away")
-            uz_time, us_time = dual_time(m.get("utcDate", ""))
-            lines.append(f"🇺🇿 {uz_time}  |  🇺🇸 {us_time} CDT — <b>{home}</b> — <b>{away}</b>")
+            uz, us = dual_time(m.get("utcDate", ""))
+            lines.append(f"🇺🇿 {uz}  |  🇺🇸 {us} CDT — <b>{home}</b> — <b>{away}</b>")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)

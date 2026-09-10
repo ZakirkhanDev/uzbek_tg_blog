@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from services.formatter import transfer_caption, news_caption, star_player_caption, with_footer
 from services.media import get_transfer_photo, get_news_photo
-from services.scheduler import post_daily_fixtures, post_daily_results_and_standings
+from services.scheduler import post_daily_fixtures, post_finished_top12
 
 def is_admin(user_id):
     ids = {
@@ -168,13 +168,13 @@ async def test_fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Xatolik: {e}")
 
 async def test_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin uchun: kunlik natijalar/turnir jadvali postini hoziroq yuboradi (test uchun)."""
+    """Admin uchun: Top-12 tugagan o‘yin natijalarini hoziroq tekshiradi (test uchun)."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Bu buyruq faqat adminlar uchun.")
         return
     await update.message.reply_text("⏳ Tekshiryapman...")
     try:
-        await post_daily_results_and_standings(context.application)
-        await update.message.reply_text("✅ Tayyor. Kanalga qarang.")
+        await post_finished_top12(context.application)
+        await update.message.reply_text("✅ Top-12 final natijalari tekshirildi. Kanalni qarang.")
     except Exception as e:
         await update.message.reply_text(f"❌ Xatolik: {e}")

@@ -1,184 +1,171 @@
 import os
+import logging
+from html import escape
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from services.football_api import (
-    fetch_matches, format_match, fetch_today_matches,
-    is_top_club, is_uz_top_club, ALL_COMPETITIONS, COMPETITION_NAMES,
-    fetch_match_detail, goal_scorer_for_score,
-    group_and_format_fixtures, today_uz_date_label
+    fetch_today_matches, fetch_recent_matches, is_top_club,
+    today_uz_date_label,
 )
 from services import api_football
 from services.formatter import (
-    goal_caption, daily_fixtures_header, daily_results_header, with_footer
+    daily_fixtures_header, with_footer, news_caption,
 )
-from database.db import init_db, was_posted, mark_posted, get_last_score, set_last_score
+from services.graphics import make_match_result_graphic
+from services.keyboards import channel_main_keyboard
+from services.news import get_fresh_news, get_fresh_transfer
+from database.db import init_db, was_posted, mark_posted
 
-async def check_live(app):
-    matches = fetch_matches("LIVE") + api_football.fetch_live_matches()
+log = logging.getLogger(__name__)
+_API_CACHE = {"at": 0.0, "matches": []}
+
+
+def _all_today_matches():
+    # Big-5 + UCL: football-data.org, polled every minute for near-immediate final results.
+    matches = fetch_recent_matches()
+
+    # Cups/MLS/Uzbekistan: one global API-Football request every 30 minutes.
+    # This keeps the 100-request/day free quota safe while still catching Top-12 cup finals.
+    import time
+    now = time.time()
+    if now - _API_CACHE["at"] >= 1800:
+        try:
+            _API_CACHE["matches"] = api_football.fetch_top12_matches_today()
+        except AttributeError:
+            _API_CACHE["matches"] = []
+        _API_CACHE["at"] = now
+
+    matches += _API_CACHE["matches"]
+    unique = {}
+    for m in matches:
+        if m.get("id") is not None:
+            unique[str(m["id"])] = m
+    return list(unique.values())
+
+
+async def post_finished_top12(app):
+    """Post exactly one result for each finished match involving a Top-12 club.
+
+    No goal-by-goal posts are generated anymore. The result is published as soon
+    as the API reports the match as FINISHED.
+    """
     channel = os.getenv("CHANNEL_ID")
     if not channel:
         return
 
-    for match in matches:
-        match_id = match.get("id")
-        if not match_id:
+    for match in _all_today_matches():
+        if match.get("status") != "FINISHED":
+            continue
+        home = (match.get("homeTeam") or {}).get("name", "")
+        away = (match.get("awayTeam") or {}).get("name", "")
+        if not (is_top_club(home) or is_top_club(away)):
             continue
 
-        home_name = match.get("homeTeam", {}).get("shortName") or match.get("homeTeam", {}).get("name", "Home")
-        away_name = match.get("awayTeam", {}).get("shortName") or match.get("awayTeam", {}).get("name", "Away")
-
-        # Faqat top klublar (yoki O'zbekiston Superligasining Navbahor/Pakhtakor/Neftchi/Nasaf) ishtirok etadigan o'yinlar
-        if not (
-            is_top_club(home_name) or is_top_club(away_name)
-            or is_uz_top_club(home_name) or is_uz_top_club(away_name)
-        ):
-            continue
-
-        status = match.get("status", "UNKNOWN")
-        score = match.get("score", {}).get("fullTime", {})
-        home_score = score.get("home") or 0
-        away_score = score.get("away") or 0
-
-        key = f"live:{match_id}:{home_score}:{away_score}"
+        match_id = str(match.get("id"))
+        key = f"top12:final:{match_id}"
         if was_posted(key):
             continue
 
-        last = get_last_score(match_id)
-        is_goal = (
-            last is not None
-            and (home_score, away_score) != tuple(last)
-            and (home_score > last[0] or away_score > last[1])
-        )
+        # Fetch scorers/assists and preserve team logos for the graphic.
+        if match_id.startswith("af_"):
+            match = api_football.enrich_finished_match(match)
+        else:
+            from services.football_api import enrich_finished_match
+            match = enrich_finished_match(match)
 
         try:
-            if is_goal:
-                code = match.get("competition", {}).get("code", "")
-                competition = COMPETITION_NAMES.get(code) or match.get("competition", {}).get("name", "Futbol")
-
-                # Gol muallifi va assistni aniqlashga harakat qilamiz (match detail orqali)
-                scorer, assist = None, None
-                if str(match_id).startswith("af_"):
-                    detail = api_football.fetch_match_detail(match_id)
-                    if detail:
-                        scorer, assist = api_football.goal_scorer_for_score(
-                            detail, home_score, away_score, last[0], last[1]
-                        )
-                else:
-                    detail = fetch_match_detail(match_id)
-                    if detail:
-                        scorer, assist = goal_scorer_for_score(
-                            detail, home_score, away_score, last[0], last[1]
-                        )
-
-                caption = goal_caption(
-                    competition, home_name, away_name, home_score, away_score,
-                    scorer=scorer, assist=assist
+            image_path = make_match_result_graphic(match)
+            competition = (match.get("competition") or {}).get("name", "Futbol")
+            caption_lines = [f"🏁 <b>{escape(home)} — {(match.get('score') or {}).get('fullTime', {}).get('home', 0)} : {(match.get('score') or {}).get('fullTime', {}).get('away', 0)} — {escape(away)}</b>", f"🏆 {escape(competition)}"]
+            events = match.get("events") or []
+            scorers = [e for e in events if e.get("scorer")]
+            if scorers:
+                caption_lines.append("")
+                for e in scorers[:8]:
+                    minute = f"{e.get('minute')}' " if e.get("minute") else ""
+                    assist = f" · 🎯 {e.get('assist')}" if e.get("assist") else ""
+                    caption_lines.append(f"⚽ {minute}{escape(str(e.get('scorer')))}{escape(assist)}")
+            caption = with_footer("\n".join(caption_lines))
+            with open(image_path, "rb") as photo:
+                await app.bot.send_photo(
+                    chat_id=channel,
+                    photo=photo,
+                    caption=caption[:1024],
+                    parse_mode="HTML",
                 )
-                # Talab bo'yicha: giant klub gol postlari rasmsiz, faqat matn
-                await app.bot.send_message(chat_id=channel, text=caption, parse_mode="HTML")
-            else:
-                await app.bot.send_message(
-                    chat_id=channel, text=with_footer(format_match(match)), parse_mode="HTML"
-                )
-
             mark_posted(key)
         except Exception:
-            pass
+            log.exception("Top-12 final result post failed for %s", match_id)
 
-        set_last_score(match_id, home_score, away_score)
 
 async def post_daily_fixtures(app):
     channel = os.getenv("CHANNEL_ID")
     if not channel:
         return
-
-    matches = fetch_today_matches() + api_football.fetch_today_matches()
-    scheduled = [m for m in matches if m.get("status") in ("SCHEDULED", "TIMED")]
-    if not scheduled:
+    matches = [m for m in _all_today_matches() if m.get("status") in {"SCHEDULED", "TIMED"}]
+    if not matches:
         return
-
     header = daily_fixtures_header(today_uz_date_label())
-    body = group_and_format_fixtures(scheduled)
-    text = with_footer(f"{header}\n{body}")
-
+    from services.football_api import group_and_format_fixtures
+    text = with_footer(f"{header}\n{group_and_format_fixtures(matches)}")
+    key = f"daily_fixtures:{today_uz_date_label()}"
+    if was_posted(key):
+        return
     try:
-        await app.bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+        await app.bot.send_message(
+            chat_id=channel,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=channel_main_keyboard(),
+        )
+        mark_posted(key)
     except Exception:
-        pass
+        log.exception("Daily fixtures post failed")
 
-async def post_daily_results_and_standings(app):
+
+async def post_news(app):
     channel = os.getenv("CHANNEL_ID")
     if not channel:
         return
-
-    # Natijalarni barcha futbol o'yinlari tugagandan keyin bitta post qilib yuboramiz.
-    all_today = fetch_today_matches() + api_football.fetch_today_matches()
-    if not all_today:
+    item = get_fresh_news(was_posted)
+    if not item:
         return
-
-    # Bir xil o'yin ikki manbadan kelib qolsa, ID bo'yicha dublikatni olib tashlaymiz.
-    unique = {}
-    for m in all_today:
-        if m.get("id") is not None:
-            unique[str(m["id"])] = m
-    all_today = list(unique.values())
-
-    # Hali boshlanmagan yoki davom etayotgan o'yin bo'lsa, keyingi tekshiruvni kutamiz.
-    remaining = [
-        m for m in all_today
-        if m.get("status") in {"SCHEDULED", "TIMED", "LIVE", "PAUSED"}
-    ]
-    if remaining:
-        return
-
-    finished = [m for m in all_today if m.get("status") == "FINISHED"]
-    if not finished:
-        return
-
-    # Bugungi yakuniy post faqat bir marta yuboriladi.
-    today_key = today_uz_date_label()
-    post_key = f"daily_final_results:{today_key}"
-    if was_posted(post_key):
-        return
-
-    # Natijalarni musobaqa bo'yicha guruhlab, bitta ixcham post qilamiz.
-    grouped = {}
-    for m in finished:
-        code = m.get("competition", {}).get("code", "")
-        name = COMPETITION_NAMES.get(code) or m.get("competition", {}).get("name", "Futbol")
-        grouped.setdefault(name, []).append(m)
-
-    lines = [daily_results_header()]
-    for competition, matches in sorted(grouped.items()):
-        lines.append(f"🏆 <b>{competition}</b>")
-        for m in matches:
-            lines.append(format_match(m))
-        lines.append("")
-
-    text = with_footer("\n".join(lines).rstrip())
     try:
+        text = news_caption(item["title"], item["body"] or "Yangilik tafsilotlari manba orqali.", item["source"])
         await app.bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
-        mark_posted(post_key)
+        mark_posted(item["event_key"])
     except Exception:
-        pass
+        log.exception("News post failed")
+
+
+async def post_transfer(app):
+    channel = os.getenv("CHANNEL_ID")
+    if not channel:
+        return
+    item = get_fresh_transfer(was_posted)
+    if not item:
+        return
+    try:
+        text = news_caption("🔄 " + item["title"], item["body"] or "Transfer yangiligi.", item["source"])
+        await app.bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+        mark_posted(item["event_key"])
+    except Exception:
+        log.exception("Transfer post failed")
+
 
 async def setup_scheduler(app):
     init_db()
     scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Tashkent"))
 
-    scheduler.add_job(
-        check_live, "interval", minutes=1, args=[app],
-        id="live_scores", replace_existing=True
-    )
-    scheduler.add_job(
-        post_daily_fixtures, "cron", hour=8, minute=0, args=[app],
-        id="daily_fixtures", replace_existing=True
-    )
-    # Kechki yakuniy natijalarni futbol tugaguncha har 15 daqiqada tekshiramiz.
-    # Barcha bugungi o'yinlar FINISHED bo'lgach, faqat bir marta bitta post yuboriladi.
-    scheduler.add_job(
-        post_daily_results_and_standings, "interval", minutes=15, args=[app],
-        id="daily_final_results", replace_existing=True
-    )
+    # The old goal-by-goal publisher is deliberately removed.
+    scheduler.add_job(post_finished_top12, "interval", minutes=1, args=[app], id="top12_results", replace_existing=True)
+    scheduler.add_job(post_daily_fixtures, "cron", hour=8, minute=0, args=[app], id="daily_fixtures", replace_existing=True)
+
+    # 2–3 fresh editorial items per day. Feed URLs can be overridden in .env.
+    for i, hour in enumerate((10, 15, 20), start=1):
+        scheduler.add_job(post_news, "cron", hour=hour, minute=10, args=[app], id=f"news_{i}", replace_existing=True)
+        scheduler.add_job(post_transfer, "cron", hour=hour, minute=40, args=[app], id=f"transfer_{i}", replace_existing=True)
 
     scheduler.start()
+    log.info("Scheduler started: Top-12 finals every minute; fixtures 08:00; news/transfers 3x/day.")
